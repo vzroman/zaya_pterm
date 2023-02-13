@@ -1,0 +1,15 @@
+{application, zaya_pterm,
+ [{description, "persistent term driver for zaya"},
+  {vsn, git},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, []},
+  {included_applications,[
+  ]},
+  {licenses, ["MIT"]},
+  {links, []}
+ ]}.
