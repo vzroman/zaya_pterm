@@ -46,6 +46,9 @@
   get_size/1
 ]).
 
+-record(data,{ dict, index }).
+-define(ref(Ref),{?MODULE, Ref}).
+
 %%=================================================================
 %%	SERVICE
 %%=================================================================
@@ -53,15 +56,17 @@ create( Params )->
   open( Params ).
 
 open( _Params )->
-  ets:new(?MODULE,[
-    public,
-    ordered_set,
-    {read_concurrency, true},
-    {write_concurrency, true}
-  ]).
+
+  Ref = ?ref(erlang:make_ref()),
+  persistent_term:put(Ref,#data{
+    dict = #{},
+    index = gb_sets:new()
+  }),
+
+  Ref.
 
 close( Ref )->
-  catch ets:delete( Ref ),
+  catch persistent_term:erase( Ref ),
   ok.
 
 remove( _Params )->
@@ -70,70 +75,97 @@ remove( _Params )->
 %%=================================================================
 %%	LOW_LEVEL
 %%=================================================================
-read(Ref, [Key|Rest])->
-  case ets:lookup(Ref,Key) of
-    [Rec]->
-      [Rec | read(Ref, Rest)];
+read( Ref, Keys )->
+  #data{ dict = Dict } = persistent_term:get( Ref ),
+  do_read( Dict, Keys ).
+
+do_read(Dict, [Key|Rest])->
+  case maps:find(Key, Dict) of
+    {ok,Value}->
+      [{Key, Value} | do_read(Dict, Rest)];
     _->
-      read(Ref, Rest)
+      do_read(Dict, Rest)
   end;
-read(_Ref,[])->
+do_read(_Dict,[])->
   [].
 
 write(Ref, KVs)->
-  ets:insert( Ref, KVs ),
+  Data0 = persistent_term:get( Ref ),
+  Data = do_write( Data0, KVs ),
+  persistent_term:put( Ref, Data ),
   ok.
+
+do_write( #data{ dict = Dict, index = Index } = Data, [{K,V} | Rest])->
+  do_write(Data#data{ dict = Dict#{ K => V }, index = gb_sets:add_element(K, Index) }, Rest);
+do_write(Data, [])->
+  Data.
+
 
 delete(Ref,Keys)->
-  [ ets:delete(Ref, K) || K <- Keys],
+  Data0 = persistent_term:get( Ref ),
+  Data = do_delete( Data0, Keys ),
+  persistent_term:put( Ref, Data ),
   ok.
 
+do_delete( #data{ dict = Dict, index = Index } = Data, [K | Rest])->
+  do_delete(Data#data{ dict = maps:remove(K, Dict), index = gb_sets:del_element(K, Index) }, Rest);
+do_delete(Data, [])->
+  Data.
 
 %%=================================================================
 %%	ITERATOR
 %%=================================================================
 first( Ref )->
-  case ets:first( Ref ) of
-    '$end_of_table'-> throw( undefined );
-    Key->
-      case ets:lookup(Ref, Key ) of
-        [Rec]->
-          Rec;
-        _->
-          next( Ref, Key )
-      end
+  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+  try
+    First = gb_sets:smallest( Index ),
+    {First, maps:get(First, Dict)}
+  catch
+    _:_-> throw( undefined )
   end.
 
 last( Ref )->
-  case ets:last( Ref ) of
-    '$end_of_table'-> throw( undefined );
-    Key->
-      case ets:lookup(Ref, Key ) of
-        [Rec]->
-          Rec;
-        _->
-          prev( Ref, Key )
-      end
+  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+  try
+    Last = gb_sets:largest( Index ),
+    {Last, maps:get(Last, Dict)}
+  catch
+    _:_-> throw( undefined )
   end.
 
 next( Ref, Key )->
-  case ets:next( Ref, Key ) of
-    '$end_of_table' -> throw( undefined );
-    Next->
-      case ets:lookup( Ref, Next ) of
-        [Rec]-> Rec;
-        _-> next( Ref, Next )
-      end
+  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+  I = gb_sets:iterator_from(Key, Index),
+  case gb_sets:next( I ) of
+    {Key, I1} ->
+      case gb_sets:next( I1 ) of
+        {Next, _}-> {Next, maps:get(Next, Dict)};
+        _-> throw( undefined )
+      end;
+    {Next,_}->
+      {Next, maps:get(Next, Dict)};
+    _->
+      throw( undefined )
   end.
 
 prev( Ref, Key )->
-  case ets:prev( Ref, Key ) of
-    '$end_of_table' -> throw( undefined );
-    Prev->
-      case ets:lookup( Ref, Prev ) of
-        [Rec]-> Rec;
-        _-> prev( Ref, Prev )
+  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+  try
+    gb_sets:fold(fun(N, Prev)->
+      if
+        N >= Key->
+          if
+            Prev < Key -> throw({prev, Prev});
+            true -> throw( undefined )
+          end;
+        true ->
+          N
       end
+    end, Key, Index ),
+    throw( undefined )
+  catch
+    _:{prev, Prev}->
+      {Prev, maps:get(Prev, Dict)}
   end.
 
 %%=================================================================
@@ -141,137 +173,109 @@ prev( Ref, Key )->
 %%=================================================================
 %----------------------FIND------------------------------------------
 find(Ref, Query)->
-  case {Query, maps:size( Query )} of
-    { #{ ms := MS }, 1} ->
-      ets:select(Ref, MS);
-    { #{ms := MS, limit := Limit}, 2}->
-      case ets:select(Ref, MS, Limit) of
-        {Result, _Continuation}->
-          Result;
-        '$end_of_table' ->
-          throw( undefined )
-      end;
+  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+
+  Itr =
+    case Query of
+      #{start := Start}-> gb_sets:iterator_from(Start, Index);
+      _-> gb_sets:iterator( Index )
+    end,
+
+  case Query of
+    #{ stop:=Stop, ms:= MS, limit:=Limit }->
+      CompiledMS = ets:match_spec_compile(MS),
+      iterate_query(gb_sets:next(Itr), Dict, Stop, CompiledMS, Limit );
+    #{ stop:=Stop, ms:= MS}->
+      CompiledMS = ets:match_spec_compile(MS),
+      iterate_ms_stop(gb_sets:next(Itr), Dict, Stop, CompiledMS );
+    #{ stop:= Stop, limit := Limit }->
+      iterate_stop_limit(gb_sets:next(Itr), Dict, Stop, Limit );
+    #{ stop:= Stop }->
+      iterate_stop(gb_sets:next(Itr), Dict, Stop);
+    #{ms:= MS, limit := Limit}->
+      iterate_ms_limit(gb_sets:next(Itr), Dict, ets:match_spec_compile(MS), Limit );
+    #{ms:= MS}->
+      iterate_ms(gb_sets:next(Itr), Dict, ets:match_spec_compile(MS) );
+    #{limit := Limit}->
+      iterate_limit(gb_sets:next(Itr), Dict, Limit );
     _->
-      First =
-        case Query of
-          #{ start := Start} -> Start;
-          _-> ets:first( Ref )
-        end,
-        case Query of
-          #{  stop := Stop, ms := MS, limit := Limit }->
-            CompiledMS = ets:match_spec_compile(MS),
-            iterate_query(First, Ref, Stop, CompiledMS, Limit  );
-          #{  stop := Stop, ms := MS }->
-            CompiledMS = ets:match_spec_compile(MS),
-            iterate_ms_stop(First, Ref, Stop, CompiledMS );
-          #{ stop:= Stop, limit := Limit }->
-            iterate_stop_limit(First, Ref, Stop, Limit );
-          #{ stop:= Stop }->
-            iterate_stop(First, Ref, Stop );
-          #{ms := MS, limit := Limit}->
-            CompiledMS = ets:match_spec_compile(MS),
-            iterate_ms_limit(First, Ref, CompiledMS, Limit );
-          #{ms := MS}->
-            CompiledMS = ets:match_spec_compile(MS),
-            iterate_ms(First, Ref, CompiledMS );
-          _->
-            case Query of
-              #{start:=_}->
-                iterate( First, Ref );
-              _->
-                ets:tab2list( Ref )
-            end
-        end
+      iterate(gb_sets:next(Itr), Dict )
   end.
 
-iterate_query('$end_of_table', _Ref, _StopKey, _MS, _Limit  )->
-  [];
-iterate_query(Key, Ref, StopKey, MS, Limit  ) when Key =< StopKey, Limit > 0->
-  case ets:match_spec_run(ets:lookup(Ref, Key ), MS) of
+iterate_query({K, Itr}, Dict, StopKey, MS, Limit ) when K =< StopKey, Limit > 0->
+  Rec = {K, maps:get(K, Dict) },
+  case ets:match_spec_run([Rec], MS) of
     [Res]->
-      [Res | iterate_query(ets:next(Ref,Key), Ref, StopKey, MS, Limit -1 )];
+      [Res| iterate_query( gb_sets:next(Itr), Dict, StopKey, MS, Limit - 1 )];
     []->
-      iterate_query(ets:next(Ref,Key), Ref, StopKey, MS, Limit  )
+      iterate_query(gb_sets:next(Itr), Dict, StopKey, MS, Limit )
   end;
-iterate_query(_Key, _Ref, _StopKey, _MS, _Limit  )->
+iterate_query(_, _Dict, _StopKey, _MS, _Limit )->
   [].
 
-iterate_ms_stop('$end_of_table', _Ref, _StopKey, _MS )->
-  [];
-iterate_ms_stop(Key, Ref, StopKey, MS ) when Key =< StopKey->
-  case ets:match_spec_run(ets:lookup(Ref, Key ), MS) of
+iterate_ms_stop({K,Itr}, Dict, StopKey, MS) when K =< StopKey->
+  Rec = {K, maps:get(K, Dict) },
+  case ets:match_spec_run([Rec], MS) of
     [Res]->
-      [Res | iterate_ms_stop(ets:next(Ref,Key), Ref, StopKey, MS )];
+      [Res| iterate_ms_stop( gb_sets:next(Itr), Dict, StopKey, MS )];
     []->
-      iterate_ms_stop(ets:next(Ref,Key), Ref, StopKey, MS )
+      iterate_ms_stop( gb_sets:next(Itr), Dict, StopKey, MS )
   end;
-iterate_ms_stop(_Key, _Ref, _StopKey, _MS )->
+iterate_ms_stop(_, _Dict, _StopKey, _MS )->
   [].
 
-iterate_stop_limit('$end_of_table', _Ref, _StopKey, _Limit )->
-  [];
-iterate_stop_limit(Key, Ref, StopKey, Limit ) when Key =< StopKey, Limit > 0->
-  case ets:lookup(Ref, Key ) of
-    [Res]->
-      [Res | iterate_stop_limit(ets:next(Ref,Key), Ref, StopKey, Limit-1 )];
-    []->
-      iterate_stop_limit(ets:next(Ref,Key), Ref, StopKey, Limit )
-  end;
-iterate_stop_limit(_Key, _Ref, _StopKey, _Limit )->
+iterate_stop_limit({K,Itr}, Dict, StopKey, Limit ) when K =< StopKey, Limit > 0->
+  [{K,maps:get(K, Dict) }| iterate_stop_limit( gb_sets:next(Itr), Dict, StopKey, Limit -1 )];
+iterate_stop_limit(_, _Dict, _StopKey, _Limit )->
   [].
 
-iterate_stop('$end_of_table', _Ref, _StopKey )->
-  [];
-iterate_stop(Key, Ref, StopKey ) when Key =< StopKey->
-  case ets:lookup(Ref, Key ) of
-    [Res]->
-      [Res | iterate_stop(ets:next(Ref,Key), Ref, StopKey)];
-    []->
-      iterate_stop(ets:next(Ref,Key), Ref, StopKey )
-  end;
-iterate_stop(_Key, _Ref, _StopKey )->
+iterate_stop({K, Itr}, Dict, StopKey ) when K =< StopKey->
+  [{K, maps:get(K, Dict) }| iterate_stop( gb_sets:next(Itr), Dict, StopKey )];
+iterate_stop(_, _Dict, _StopKey )->
   [].
 
-
-iterate_ms_limit('$end_of_table', _Ref, _MS, _Limit )->
-  [];
-iterate_ms_limit(Key, Ref, MS, Limit ) when Limit > 0 ->
-  case ets:match_spec_run(ets:lookup(Ref, Key ),MS) of
+iterate_ms_limit({K,Itr}, Dict, MS, Limit ) when Limit >0->
+  Rec = {K, maps:get(K, Dict)},
+  case ets:match_spec_run([Rec], MS) of
     [Res]->
-      [Res | iterate_ms_limit(ets:next(Ref,Key), Ref, MS, Limit -1)];
+      [Res| iterate_ms_limit( gb_sets:next(Itr), Dict, MS, Limit - 1 )];
     []->
-      iterate_ms_limit(ets:next(Ref,Key), Ref, MS, Limit )
+      iterate_ms_limit( gb_sets:next(Itr), Dict, MS, Limit )
   end;
-iterate_ms_limit(_Key, _Ref, _MS, _Limit )->
+iterate_ms_limit(_, _Dict, _MS, _Limit )->
   [].
 
-iterate_ms('$end_of_table', _Ref, _MS )->
-  [];
-iterate_ms(Key, Ref, MS )->
-  case ets:match_spec_run(ets:lookup(Ref, Key ),MS) of
+iterate_ms({K, Itr}, Dict, MS )->
+  Rec = {K, maps:get(K, Dict)},
+  case ets:match_spec_run([Rec], MS) of
     [Res]->
-      [Res | iterate_ms(ets:next(Ref,Key), Ref, MS)];
+      [Res| iterate_ms( gb_sets:next(Itr), Dict, MS )];
     []->
-      iterate_ms(ets:next(Ref,Key), Ref, MS )
-  end.
+      iterate_ms( gb_sets:next(Itr), Dict, MS )
+  end;
+iterate_ms(_, _Dict, _MS )->
+  [].
 
-iterate('$end_of_table', _Ref )->
-  [];
-iterate(Key, Ref )->
-  case ets:lookup(Ref, Key ) of
-    [Res]->
-      [Res | iterate(ets:next(Ref,Key), Ref)];
-    []->
-      iterate(ets:next(Ref,Key), Ref )
-  end.
+iterate_limit({K, Itr}, Dict, Limit) when Limit >0->
+  [{K, maps:get(K, Dict)} | iterate_limit( gb_sets:next(Itr), Dict, Limit-1 ) ];
+iterate_limit(_, _Dict, _Limit )->
+  [].
+
+iterate({K,Itr}, Dict)->
+  [{K, maps:get(K, Dict)} | iterate( gb_sets:next(Itr), Dict ) ];
+iterate(_, _Dict )->
+  [].
 
 %----------------------FOLD LEFT------------------------------------------
 foldl( Ref, Query, UserFun, InAcc )->
-  First =
+  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+
+  Itr =
     case Query of
-      #{start := Start}-> Start;
-      _->ets:first( Ref )
+      #{start := Start}-> gb_sets:iterator_from(Start, Index);
+      _-> gb_sets:iterator( Index )
     end,
+
   Fun =
     case Query of
       #{ms:=MS}->
@@ -291,44 +295,39 @@ foldl( Ref, Query, UserFun, InAcc )->
   try
     case Query of
       #{ stop:=Stop }->
-        do_foldl_stop( First, Ref, Fun, InAcc, Stop);
+        do_foldl_stop( gb_sets:next(Itr), Dict, Fun, InAcc, Stop);
       _->
-        do_foldl( First, Ref, Fun, InAcc )
+        do_foldl( gb_sets:next(Itr), Dict, Fun, InAcc )
     end
   catch
     {stop,Acc}->Acc
   end.
 
-do_foldl_stop('$end_of_table', _Ref, _Fun, Acc, _StopKey)->
-  Acc;
-do_foldl_stop( Key, Ref, Fun, InAcc, StopKey ) when Key =< StopKey->
-  case ets:lookup(Ref, Key) of
-    [Rec]->
-      Acc = Fun( Rec, InAcc ),
-      do_foldl_stop( ets:next(Ref, Key), Ref, Fun, Acc, StopKey  );
-    []->
-      do_foldl_stop( ets:next(Ref, Key), Ref, Fun, InAcc, StopKey  )
-  end;
-do_foldl_stop(_Key, _Ref, _Fun, Acc, _StopKey)->
+do_foldl_stop( {Key, Itr}, Dict, Fun, InAcc, StopKey ) when Key =< StopKey->
+  Rec = {Key, maps:get(Key, Dict)},
+  Acc = Fun( Rec, InAcc ),
+  do_foldl_stop( gb_sets:next(Itr), Dict, Fun, Acc, StopKey  );
+do_foldl_stop(_, _Dict, _Fun, Acc, _StopKey)->
   Acc.
 
-do_foldl( '$end_of_table', _Ref, _Fun, Acc )->
-  Acc;
-do_foldl( Key, Ref, Fun, InAcc )->
-  case ets:lookup(Ref, Key) of
-    [Rec]->
-      Acc = Fun( Rec, InAcc ),
-      do_foldl( ets:next(Ref, Key), Ref, Fun, Acc  );
-    []->
-      do_foldl( ets:next(Ref, Key), Ref, Fun, InAcc  )
-  end.
+
+do_foldl({Key,Itr}, Dict, Fun, InAcc )->
+  Rec = {Key, maps:get(Key, Dict)},
+  Acc = Fun( Rec, InAcc ),
+  do_foldl(gb_sets:next(Itr), Dict, Fun, Acc );
+do_foldl(_, _Dict, _Fun, Acc )->
+  Acc.
 
 %----------------------FOLD RIGHT------------------------------------------
 foldr( Ref, Query, UserFun, InAcc )->
-  Last =
+  #data{ dict = Dict} = persistent_term:get( Ref ),
+
+  Records0 = lists:reverse( lists:usort( maps:to_list( Dict ))),
+
+  Records =
     case Query of
-      #{start := Start}-> Start;
-      _->ets:last( Ref )
+      #{start := Start}-> lists:dropwhile(fun({K,_})->K > Start end, Records0);
+      _->Records0
     end,
   Fun =
     case Query of
@@ -349,43 +348,32 @@ foldr( Ref, Query, UserFun, InAcc )->
   try
     case Query of
       #{ stop:=Stop }->
-        do_foldr_stop( Last, Ref, Fun, InAcc, Stop);
+        do_foldr_stop( Records, Fun, InAcc, Stop);
       _->
-        do_foldr( Last, Ref, Fun, InAcc )
+        do_foldr( Records, Fun, InAcc )
     end
   catch
     {stop,Acc}-> Acc
   end.
 
-do_foldr_stop('$end_of_table', _Ref, _Fun, Acc, _StopKey )->
-  Acc;
-do_foldr_stop( Key, Ref, Fun, InAcc, StopKey ) when Key >= StopKey->
-  case ets:lookup(Ref, Key) of
-    [Rec]->
-      Acc = Fun( Rec, InAcc ),
-      do_foldr_stop( ets:prev(Ref, Key), Ref, Fun, Acc, StopKey  );
-    []->
-      do_foldr_stop( ets:prev(Ref, Key), Ref, Fun, InAcc, StopKey  )
-  end;
-do_foldr_stop(_Key, _Ref, _Fun, Acc, _StopKey)->
+do_foldr_stop( [{Key,_}=Rec| Rest], Fun, InAcc, StopKey ) when Key >= StopKey->
+  Acc = Fun( Rec, InAcc ),
+  do_foldr_stop( Rest, Fun, Acc, StopKey  );
+do_foldr_stop([], _Fun, Acc, _StopKey)->
   Acc.
 
-do_foldr('$end_of_table', _Ref, _Fun, Acc )->
-  Acc;
-do_foldr( Key, Ref, Fun, InAcc )->
-  case ets:lookup(Ref, Key) of
-    [Rec]->
-      Acc = Fun( Rec, InAcc ),
-      do_foldr( ets:prev(Ref, Key), Ref, Fun, Acc  );
-    []->
-      do_foldr( ets:prev(Ref, Key), Ref, Fun, InAcc  )
-  end.
+do_foldr( [Rec| Rest], Fun, InAcc )->
+  Acc = Fun( Rec, InAcc ),
+  do_foldr( Rest, Fun, Acc  );
+do_foldr([], _Fun, Acc )->
+  Acc.
 
 %%=================================================================
 %%	INFO
 %%=================================================================
 get_size( Ref )->
-  erlang:system_info(wordsize) * ets:info( Ref, memory ).
+  Data = persistent_term:get( Ref ),
+  size( term_to_binary( Data ) ).
 
 
 
