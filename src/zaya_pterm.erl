@@ -158,23 +158,23 @@ next( Ref, Key )->
 
 prev( Ref, Key )->
   #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
-  try
-    gb_sets:fold(fun(N, Prev)->
-      if
-        N >= Key->
-          if
-            Prev < Key -> throw({prev, Prev});
-            true -> throw( undefined )
-          end;
-        true ->
-          N
-      end
-    end, Key, Index ),
-    throw( undefined )
-  catch
-    _:{prev, Prev}->
-      {Prev, maps:get(Prev, Dict)}
+  case prev_key(Key, Index) of
+    undefined ->
+      throw( undefined );
+    PrevKey ->
+      {PrevKey, maps:get(PrevKey, Dict)}
   end.
+
+prev_key(K, {_, T})->
+  prev_key(K, T, undefined).
+prev_key(K, {TK, L, _R}, Prev) when K < TK->
+  prev_key(K, L, Prev);
+prev_key(K, {TK, _L, R}, _Prev) when K > TK ->
+  prev_key(K, R, TK);
+prev_key(K, {TK, _L, R}, Prev) when K =:= TK ->
+  prev_key(K, R, Prev);
+prev_key(_K, nil, Prev) ->
+  Prev.
 
 %%=================================================================
 %%	HIGH-LEVEL API
