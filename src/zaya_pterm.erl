@@ -171,8 +171,8 @@ prev_key(K, {TK, L, _R}, Prev) when K < TK->
   prev_key(K, L, Prev);
 prev_key(K, {TK, _L, R}, _Prev) when K > TK ->
   prev_key(K, R, TK);
-prev_key(K, {TK, _L, R}, Prev) when K =:= TK ->
-  prev_key(K, R, Prev);
+prev_key(K, {TK, L, _R}, Prev) when K =:= TK ->
+  prev_key(K, L, Prev);
 prev_key(_K, nil, Prev) ->
   Prev.
 
