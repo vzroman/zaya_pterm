@@ -129,7 +129,7 @@ first( Ref )->
     First = gb_sets:smallest( Index ),
     {First, maps:get(First, Dict)}
   catch
-    _:_-> throw( undefined )
+    _:_-> undefined
   end.
 
 last( Ref )->
@@ -138,7 +138,7 @@ last( Ref )->
     Last = gb_sets:largest( Index ),
     {Last, maps:get(Last, Dict)}
   catch
-    _:_-> throw( undefined )
+    _:_-> undefined
   end.
 
 next( Ref, Key )->
@@ -148,19 +148,19 @@ next( Ref, Key )->
     {Key, I1} ->
       case gb_sets:next( I1 ) of
         {Next, _}-> {Next, maps:get(Next, Dict)};
-        _-> throw( undefined )
+        _-> undefined
       end;
     {Next,_}->
       {Next, maps:get(Next, Dict)};
     _->
-      throw( undefined )
+      undefined
   end.
 
 prev( Ref, Key )->
   #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
   case prev_key(Key, Index) of
     undefined ->
-      throw( undefined );
+      undefined;
     PrevKey ->
       {PrevKey, maps:get(PrevKey, Dict)}
   end.
