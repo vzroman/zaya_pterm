@@ -53,7 +53,10 @@
 -export([
   transaction/1,
   t_write/3,
+  t_delete/3,
   commit/2,
+  commit1/2,
+  commit2/2,
   rollback/2
 ]).
 
@@ -66,6 +69,7 @@
 
 -record(data,{ dict, index }).
 -define(ref(Ref),{?MODULE, Ref}).
+-define(none, {?MODULE, undefined}).
 
 %%=================================================================
 %%	SERVICE
@@ -406,20 +410,39 @@ transaction( _Ref )->
     {write_concurrency, auto}
   ]).
 
-t_write( _Ref, TransactionRef, KVs )->
-  ets:insert( TransactionRef, KVs ),
+t_write( _Ref, TRef, KVs )->
+  ets:insert( TRef, KVs ),
   ok.
 
-commit(Ref, TransactionRef)->
+t_delete( _Ref, TRef, Keys )->
+  ets:insert( TRef, [{K, ?none} || K <- Keys] ),
+  ok.
+
+commit(Ref, TRef)->
+  {Write, Delete} = write_delete( ets:tab2list( TRef ), {[],[]} ),
   try
-    write( Ref, ets:tab2list( TransactionRef ) )
+    write( Ref, Write ),
+    delete( Ref, Delete )
   after
-    ets:delete( TransactionRef )
+    ets:delete( TRef )
   end.
 
-rollback( _Ref, TransactionRef )->
-  ets:delete( TransactionRef ),
+commit1(_Ref, _TRef)->
   ok.
+
+commit2(Ref, TRef)->
+  commit( Ref, TRef ).
+
+rollback( _Ref, TRef )->
+  ets:delete( TRef ),
+  ok.
+
+write_delete([{K, ?none}|Rest], {Write, Delete})->
+  write_delete( Rest, { Write, [K|Delete] } );
+write_delete([E|Rest], {Write, Delete})->
+  write_delete( Rest, {[E|Write], Delete} );
+write_delete([], Acc)->
+  Acc.
 
 %%=================================================================
 %%	INFO
