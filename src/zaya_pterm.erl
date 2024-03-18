@@ -48,6 +48,16 @@
 ]).
 
 %%=================================================================
+%%	TRANSACTION API
+%%=================================================================
+-export([
+  commit/3,
+  commit1/3,
+  commit2/2,
+  rollback/2
+]).
+
+%%=================================================================
 %%	INFO API
 %%=================================================================
 -export([
@@ -56,6 +66,7 @@
 
 -record(data,{ dict, index }).
 -define(ref(Ref),{?MODULE, Ref}).
+-define(none, {?MODULE, undefined}).
 
 %%=================================================================
 %%	SERVICE
@@ -384,6 +395,23 @@ copy(Ref, Fun, InAcc)->
 
 dump_batch(Ref, KVs)->
   write(Ref, KVs).
+
+%%=================================================================
+%%	TRANSACTION API
+%%=================================================================
+commit(Ref, Write, Delete)->
+  write( Ref, Write ),
+  delete( Ref, Delete ),
+  ok.
+
+commit1(_Ref, Write, Delete)->
+  {Write, Delete}.
+
+commit2(Ref, {Write, Delete})->
+  commit( Ref, Write, Delete ).
+
+rollback( _Ref, _TRef )->
+  ok.
 
 %%=================================================================
 %%	INFO
