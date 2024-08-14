@@ -64,9 +64,11 @@
   get_size/1
 ]).
 
+-record(ref,{ pterm, locks }).
 -record(data,{ dict, index }).
 -define(ref(Ref),{?MODULE, Ref}).
 -define(none, {?MODULE, undefined}).
+-define(locks(Ref), binary_to_atom( unicode:characters_to_binary(io_lib:format("~p",[Ref])), utf8) ).
 
 %%=================================================================
 %%	SERVICE
@@ -76,16 +78,19 @@ create( Params )->
 
 open( _Params )->
 
-  Ref = ?ref(erlang:make_ref()),
-  persistent_term:put(Ref,#data{
+  PTerm = ?ref(erlang:make_ref()),
+  {ok, LocksPid} = elock:start_link( ?locks(PTerm) ),
+  persistent_term:put(PTerm, #data{
     dict = #{},
     index = gb_sets:new()
   }),
 
-  Ref.
+  #ref{ pterm = PTerm, locks = LocksPid }.
 
-close( Ref )->
-  catch persistent_term:erase( Ref ),
+close(#ref{ pterm = PTerm, locks = LocksPid })->
+  catch unlink( LocksPid ),
+  catch exit( LocksPid, shutdown ),
+  catch persistent_term:erase( PTerm ),
   ok.
 
 remove( _Params )->
@@ -94,8 +99,8 @@ remove( _Params )->
 %%=================================================================
 %%	LOW_LEVEL
 %%=================================================================
-read( Ref, Keys )->
-  #data{ dict = Dict } = persistent_term:get( Ref ),
+read(#ref{ pterm = PTerm }, Keys )->
+  #data{ dict = Dict } = persistent_term:get( PTerm ),
   do_read( Dict, Keys ).
 
 do_read(Dict, [Key|Rest])->
@@ -108,11 +113,16 @@ do_read(Dict, [Key|Rest])->
 do_read(_Dict,[])->
   [].
 
-write(Ref, KVs)->
-  Data0 = persistent_term:get( Ref ),
-  Data = do_write( Data0, KVs ),
-  persistent_term:put( Ref, Data ),
-  ok.
+write(#ref{ pterm = PTerm }, KVs)->
+  {ok, Unlock} = elock:lock(?locks( PTerm ), PTerm, _IsShared = false, _Timeout = infinity ),
+  try
+    Data0 = persistent_term:get( PTerm ),
+    Data = do_write( Data0, KVs ),
+    persistent_term:put( PTerm, Data ),
+    ok
+  after
+    Unlock()
+  end.
 
 do_write( #data{ dict = Dict, index = Index } = Data, [{K,V} | Rest])->
   do_write(Data#data{ dict = Dict#{ K => V }, index = gb_sets:add_element(K, Index) }, Rest);
@@ -120,11 +130,16 @@ do_write(Data, [])->
   Data.
 
 
-delete(Ref,Keys)->
-  Data0 = persistent_term:get( Ref ),
-  Data = do_delete( Data0, Keys ),
-  persistent_term:put( Ref, Data ),
-  ok.
+delete(#ref{ pterm = PTerm },Keys)->
+  {ok, Unlock} = elock:lock(?locks( PTerm ), PTerm, _IsShared = false, _Timeout = infinity ),
+  try
+    Data0 = persistent_term:get( PTerm ),
+    Data = do_delete( Data0, Keys ),
+    persistent_term:put( PTerm, Data ),
+    ok
+  after
+    Unlock()
+  end.
 
 do_delete( #data{ dict = Dict, index = Index } = Data, [K | Rest])->
   do_delete(Data#data{ dict = maps:remove(K, Dict), index = gb_sets:del_element(K, Index) }, Rest);
@@ -134,8 +149,8 @@ do_delete(Data, [])->
 %%=================================================================
 %%	ITERATOR
 %%=================================================================
-first( Ref )->
-  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+first( #ref{ pterm = PTerm } )->
+  #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
   try
     First = gb_sets:smallest( Index ),
     {First, maps:get(First, Dict)}
@@ -143,8 +158,8 @@ first( Ref )->
     _:_-> undefined
   end.
 
-last( Ref )->
-  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+last( #ref{ pterm = PTerm } )->
+  #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
   try
     Last = gb_sets:largest( Index ),
     {Last, maps:get(Last, Dict)}
@@ -152,8 +167,8 @@ last( Ref )->
     _:_-> undefined
   end.
 
-next( Ref, Key )->
-  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+next( #ref{ pterm = PTerm }, Key )->
+  #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
   I = gb_sets:iterator_from(Key, Index),
   case gb_sets:next( I ) of
     {Key, I1} ->
@@ -167,8 +182,8 @@ next( Ref, Key )->
       undefined
   end.
 
-prev( Ref, Key )->
-  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+prev( #ref{ pterm = PTerm }, Key )->
+  #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
   case prev_key(Key, Index) of
     undefined ->
       undefined;
@@ -191,8 +206,8 @@ prev_key(_K, nil, Prev) ->
 %%	HIGH-LEVEL API
 %%=================================================================
 %----------------------FIND------------------------------------------
-find(Ref, Query)->
-  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+find(#ref{ pterm = PTerm }, Query)->
+  #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
 
   Itr =
     case Query of
@@ -286,8 +301,8 @@ iterate(_, _Dict )->
   [].
 
 %----------------------FOLD LEFT------------------------------------------
-foldl( Ref, Query, UserFun, InAcc )->
-  #data{ dict = Dict, index = Index } = persistent_term:get( Ref ),
+foldl( #ref{ pterm = PTerm }, Query, UserFun, InAcc )->
+  #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
 
   Itr =
     case Query of
@@ -338,8 +353,8 @@ do_foldl(_, _Dict, _Fun, Acc )->
   Acc.
 
 %----------------------FOLD RIGHT------------------------------------------
-foldr( Ref, Query, UserFun, InAcc )->
-  #data{ dict = Dict} = persistent_term:get( Ref ),
+foldr( #ref{ pterm = PTerm }, Query, UserFun, InAcc )->
+  #data{ dict = Dict} = persistent_term:get( PTerm ),
 
   Records0 = lists:reverse( lists:usort( maps:to_list( Dict ))),
 
@@ -416,8 +431,8 @@ rollback( _Ref, _TRef )->
 %%=================================================================
 %%	INFO
 %%=================================================================
-get_size( Ref )->
-  Data = persistent_term:get( Ref ),
+get_size( #ref{ pterm = PTerm } )->
+  Data = persistent_term:get( PTerm ),
   size( term_to_binary( Data ) ).
 
 
