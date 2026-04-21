@@ -1,3 +1,4 @@
 rebar.lock
 zaya_pterm.iml
 _build/*
+.worktrees/*
