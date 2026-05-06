@@ -306,8 +306,8 @@ foldl( #ref{ pterm = PTerm }, Query, UserFun, InAcc )->
 
   Itr =
     case Query of
-      #{start := Start}-> gb_sets:iterator_from(Start, Index);
-      _-> gb_sets:iterator( Index )
+      #{start := Start}-> gb_sets:iterator_from(Start, Index, ordered);
+      _-> gb_sets:iterator( Index, ordered )
     end,
 
   Fun =
@@ -354,15 +354,14 @@ do_foldl(_, _Dict, _Fun, Acc )->
 
 %----------------------FOLD RIGHT------------------------------------------
 foldr( #ref{ pterm = PTerm }, Query, UserFun, InAcc )->
-  #data{ dict = Dict} = persistent_term:get( PTerm ),
+  #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
 
-  Records0 = lists:reverse( lists:usort( maps:to_list( Dict ))),
-
-  Records =
+  Itr =
     case Query of
-      #{start := Start}-> lists:dropwhile(fun({K,_})->K > Start end, Records0);
-      _->Records0
+      #{start := Start}-> gb_sets:iterator_from(Start, Index, reversed);
+      _-> gb_sets:iterator( Index, reversed )
     end,
+
   Fun =
     case Query of
       #{ms:=MS}->
@@ -382,24 +381,26 @@ foldr( #ref{ pterm = PTerm }, Query, UserFun, InAcc )->
   try
     case Query of
       #{ stop:=Stop }->
-        do_foldr_stop( Records, Fun, InAcc, Stop);
+        do_foldr_stop( gb_sets:next(Itr), Dict, Fun, InAcc, Stop);
       _->
-        do_foldr( Records, Fun, InAcc )
+        do_foldr( gb_sets:next(Itr), Dict, Fun, InAcc )
     end
   catch
     {stop,Acc}-> Acc
   end.
 
-do_foldr_stop( [{Key,_}=Rec| Rest], Fun, InAcc, StopKey ) when Key >= StopKey->
+do_foldr_stop( {Key, Itr}, Dict, Fun, InAcc, StopKey ) when Key >= StopKey->
+  Rec = {Key, maps:get(Key, Dict)},
   Acc = Fun( Rec, InAcc ),
-  do_foldr_stop( Rest, Fun, Acc, StopKey  );
-do_foldr_stop([], _Fun, Acc, _StopKey)->
+  do_foldr_stop( gb_sets:next(Itr), Dict, Fun, Acc, StopKey  );
+do_foldr_stop(_, _Dict, _Fun, Acc, _StopKey)->
   Acc.
 
-do_foldr( [Rec| Rest], Fun, InAcc )->
+do_foldr( {Key,Itr}, Dict, Fun, InAcc )->
+  Rec = {Key, maps:get(Key, Dict)},
   Acc = Fun( Rec, InAcc ),
-  do_foldr( Rest, Fun, Acc  );
-do_foldr([], _Fun, Acc )->
+  do_foldr( gb_sets:next(Itr), Dict, Fun, Acc  );
+do_foldr(_, _Dict, _Fun, Acc )->
   Acc.
 
 %%=================================================================
@@ -512,4 +513,3 @@ pool_params(Ref, Params) when is_map(Params)->
       module => ?MODULE
     }
   ).
-
