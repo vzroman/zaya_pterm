@@ -31,6 +31,7 @@
   dump_batch_and_pool_batch_test/1,
   transaction_api_test/1,
   prepare_rollback_roundtrip_test/1,
+  prepare_rollback_unchanged_write_test/1,
   is_persistent_test/1,
   concurrent_write_callers_test/1
 ]).
@@ -59,6 +60,7 @@ mode_tests()->
     dump_batch_and_pool_batch_test,
     transaction_api_test,
     prepare_rollback_roundtrip_test,
+    prepare_rollback_unchanged_write_test,
     is_persistent_test,
     concurrent_write_callers_test
   ].
@@ -185,6 +187,18 @@ find_query_variants_test(Config)->
         zaya_pterm:find(Ref, #{start => 2})
       ),
       ?assertEqual(
+        [{1, one}, {3, three}, {5, five}],
+        zaya_pterm:find(Ref, #{stop => 5})
+      ),
+      ?assertEqual(
+        [{3, three}, {5, five}],
+        zaya_pterm:find(Ref, #{start => 2, stop => 5})
+      ),
+      ?assertEqual(
+        [{1, one}, {3, three}],
+        zaya_pterm:find(Ref, #{limit => 2})
+      ),
+      ?assertEqual(
         [{3, three}, {5, five}],
         zaya_pterm:find(Ref, #{start => 2, stop => 5, limit => 2})
       ),
@@ -228,6 +242,33 @@ fold_and_copy_test(Config)->
           Ref,
           #{start => 6},
           fun({Key, _Value}, Acc)-> [Key | Acc] end,
+          []
+        )
+      ),
+      ?assertEqual(
+        [1, 3, 5],
+        zaya_pterm:foldr(
+          Ref,
+          #{start => 5},
+          fun({Key, _Value}, Acc)-> [Key | Acc] end,
+          []
+        )
+      ),
+      ?assertEqual(
+        [five, three, one],
+        zaya_pterm:foldl(
+          Ref,
+          #{stop => 5},
+          fun({_K, V}, Acc)-> [V | Acc] end,
+          []
+        )
+      ),
+      ?assertEqual(
+        [three, five, seven],
+        zaya_pterm:foldr(
+          Ref,
+          #{stop => 3},
+          fun({_K, V}, Acc)-> [V | Acc] end,
           []
         )
       ),
@@ -318,6 +359,22 @@ prepare_rollback_roundtrip_test(Config)->
         read_map(Ref, [item, drop])
       ),
       ?assertEqual([], zaya_pterm:read(Ref, [fresh, missing]))
+    end
+  ).
+
+prepare_rollback_unchanged_write_test(Config)->
+  with_ref(
+    Config,
+    fun(Ref)->
+      ok = zaya_pterm:write(Ref, [{same, value}, {delete_me, doomed}]),
+      {RollbackWrite, RollbackDelete} =
+        zaya_pterm:prepare_rollback(
+          Ref,
+          [{same, value}, {new_key, new_value}],
+          [delete_me, missing_key]
+        ),
+      ?assertEqual([{delete_me, doomed}], RollbackWrite),
+      ?assertEqual([new_key], RollbackDelete)
     end
   ).
 
