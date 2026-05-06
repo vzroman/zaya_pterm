@@ -57,13 +57,20 @@
 ]).
 
 %%=================================================================
+%%	POOL API
+%%=================================================================
+-export([
+  pool_batch/2
+]).
+
+%%=================================================================
 %%	INFO API
 %%=================================================================
 -export([
   get_size/1
 ]).
 
--record(ref,{ pterm, locks }).
+-record(ref,{ pterm, locks, pool }).
 -record(data,{ dict, index }).
 -define(ref(Ref),{?MODULE, Ref}).
 -define(none, {?MODULE, undefined}).
@@ -75,18 +82,24 @@
 create( Params )->
   open( Params ).
 
-open( _Params )->
-
+open( Params )->
   PTerm = ?ref(erlang:make_ref()),
   {ok, LocksPid} = elock:start_link( ?locks(PTerm) ),
-  persistent_term:put(PTerm, #data{
-    dict = #{},
-    index = gb_sets:new()
-  }),
+  Ref = #ref{ pterm = PTerm, locks = LocksPid, pool = undefined },
+  try
+    persistent_term:put(PTerm, #data{
+      dict = #{},
+      index = gb_sets:new()
+    }),
+    open_pool(Ref, Params)
+  catch
+    Class:Reason:Stack->
+      catch close(Ref),
+      erlang:raise(Class, Reason, Stack)
+  end.
 
-  #ref{ pterm = PTerm, locks = LocksPid }.
-
-close(#ref{ pterm = PTerm, locks = LocksPid })->
+close(#ref{ pterm = PTerm, locks = LocksPid, pool = Pool })->
+  catch close_pool(Pool),
   catch unlink( LocksPid ),
   catch exit( LocksPid, shutdown ),
   catch persistent_term:erase( PTerm ),
@@ -112,16 +125,10 @@ do_read(Dict, [Key|Rest])->
 do_read(_Dict,[])->
   [].
 
-write(#ref{ pterm = PTerm }, KVs)->
-  {ok, Unlock} = elock:lock(?locks( PTerm ), PTerm, _IsShared = false, _Timeout = infinity ),
-  try
-    Data0 = persistent_term:get( PTerm ),
-    Data = do_write( Data0, KVs ),
-    persistent_term:put( PTerm, Data ),
-    ok
-  after
-    Unlock()
-  end.
+write(#ref{ pool = disabled } = Ref, KVs)->
+  locked_update(Ref, fun(Data)-> do_write(Data, KVs) end);
+write(#ref{ pool = Pool }, KVs)->
+  zaya_pool:call(Pool, [{write, KVs}]).
 
 do_write( #data{ dict = Dict, index = Index } = Data, [{K,V} | Rest])->
   do_write(Data#data{ dict = Dict#{ K => V }, index = gb_sets:add_element(K, Index) }, Rest);
@@ -129,16 +136,10 @@ do_write(Data, [])->
   Data.
 
 
-delete(#ref{ pterm = PTerm },Keys)->
-  {ok, Unlock} = elock:lock(?locks( PTerm ), PTerm, _IsShared = false, _Timeout = infinity ),
-  try
-    Data0 = persistent_term:get( PTerm ),
-    Data = do_delete( Data0, Keys ),
-    persistent_term:put( PTerm, Data ),
-    ok
-  after
-    Unlock()
-  end.
+delete(#ref{ pool = disabled } = Ref, Keys)->
+  locked_update(Ref, fun(Data)-> do_delete(Data, Keys) end);
+delete(#ref{ pool = Pool }, Keys)->
+  zaya_pool:call(Pool, [{delete, Keys}]).
 
 do_delete( #data{ dict = Dict, index = Index } = Data, [K | Rest])->
   do_delete(Data#data{ dict = maps:remove(K, Dict), index = gb_sets:del_element(K, Index) }, Rest);
@@ -408,15 +409,20 @@ copy(Ref, Fun, InAcc)->
   foldl(Ref, #{}, Fun, InAcc).
 
 dump_batch(Ref, KVs)->
-  write(Ref, KVs).
+  locked_update(Ref, fun(Data)-> do_write(Data, KVs) end).
 
 %%=================================================================
 %%	TRANSACTION API
 %%=================================================================
-commit(Ref, Write, Delete)->
-  write( Ref, Write ),
-  delete( Ref, Delete ),
-  ok.
+commit(#ref{ pool = disabled } = Ref, Write, Delete)->
+  locked_update(
+    Ref,
+    fun(Data)->
+      do_delete(do_write(Data, Write), Delete)
+    end
+  );
+commit(#ref{ pool = Pool }, Write, Delete)->
+  zaya_pool:call(Pool, [{write, Write}, {delete, Delete}]).
 
 prepare_rollback(Ref, Write, Delete)->
   prepare_rollback_from_read(fun(Keys)-> read(Ref, Keys) end, Write, Delete).
@@ -444,10 +450,61 @@ prepare_rollback_from_read(ReadFun, Write, Delete)->
   {maps:to_list(RestoreWrites), DeleteBack}.
 
 %%=================================================================
+%%	POOL API
+%%=================================================================
+pool_batch(Ref, Requests)->
+  locked_update(Ref, fun(Data)-> pool_batch(Requests, Data, _Writes = []) end).
+
+pool_batch([{write, KVs}|Rest], Data, Writes)->
+  pool_batch(Rest, Data, [KVs|Writes]);
+pool_batch(Requests, Data, [_|_]=Writes)->
+  KVs = lists:append(lists:reverse(Writes)),
+  pool_batch(Requests, do_write(Data, KVs), []);
+pool_batch([{delete, Keys}|Rest], Data, Writes)->
+  pool_batch(Rest, do_delete(Data, Keys), Writes);
+pool_batch([], Data, [])->
+  Data.
+
+%%=================================================================
 %%	INFO
 %%=================================================================
 get_size( #ref{ pterm = PTerm } )->
   Data = persistent_term:get( PTerm ),
   size( term_to_binary( Data ) ).
 
+%%=================================================================
+%%	INTERNAL UTILITIES
+%%=================================================================
+locked_update(#ref{ pterm = PTerm }, Update)->
+  {ok, Unlock} = elock:lock(?locks( PTerm ), PTerm, _IsShared = false, _Timeout = infinity ),
+  try
+    Data0 = persistent_term:get( PTerm ),
+    Data = Update(Data0),
+    persistent_term:put( PTerm, Data ),
+    ok
+  after
+    Unlock()
+  end.
+
+open_pool(Ref, #{pool := disabled})->
+  Ref#ref{pool = disabled};
+open_pool(Ref, Params) when is_map(Params)->
+  {ok, Pool} = zaya_pool:start_link(pool_params(Ref#ref{pool = disabled}, Params)),
+  Ref#ref{pool = Pool}.
+
+close_pool(undefined)->
+  ok;
+close_pool(disabled)->
+  ok;
+close_pool(Pool)->
+  zaya_pool:stop(Pool).
+
+pool_params(Ref, Params) when is_map(Params)->
+  maps:merge(
+    maps:get(pool, Params, #{}),
+    #{
+      ref => Ref,
+      module => ?MODULE
+    }
+  ).
 
