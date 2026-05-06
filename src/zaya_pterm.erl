@@ -169,7 +169,7 @@ last( #ref{ pterm = PTerm } )->
 
 next( #ref{ pterm = PTerm }, Key )->
   #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
-  I = gb_sets:iterator_from(Key, Index),
+  I = gb_sets:iterator_from(Key, Index, ordered),
   case gb_sets:next( I ) of
     {Key, I1} ->
       case gb_sets:next( I1 ) of
@@ -184,23 +184,18 @@ next( #ref{ pterm = PTerm }, Key )->
 
 prev( #ref{ pterm = PTerm }, Key )->
   #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
-  case prev_key(Key, Index) of
-    undefined ->
-      undefined;
-    PrevKey ->
-      {PrevKey, maps:get(PrevKey, Dict)}
+  I = gb_sets:iterator_from(Key, Index, reversed),
+  case gb_sets:next( I ) of
+    {Key, I1} ->
+      case gb_sets:next( I1 ) of
+        {Next, _}-> {Next, maps:get(Next, Dict)};
+        _-> undefined
+      end;
+    {Next,_}->
+      {Next, maps:get(Next, Dict)};
+    _->
+      undefined
   end.
-
-prev_key(K, {_, T})->
-  prev_key(K, T, undefined).
-prev_key(K, {TK, L, _R}, Prev) when K < TK->
-  prev_key(K, L, Prev);
-prev_key(K, {TK, _L, R}, _Prev) when K > TK ->
-  prev_key(K, R, TK);
-prev_key(K, {TK, L, _R}, Prev) when K =:= TK ->
-  prev_key(K, L, Prev);
-prev_key(_K, nil, Prev) ->
-  Prev.
 
 %%=================================================================
 %%	HIGH-LEVEL API
