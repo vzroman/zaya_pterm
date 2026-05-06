@@ -424,30 +424,35 @@ commit(#ref{ pool = disabled } = Ref, Write, Delete)->
 commit(#ref{ pool = Pool }, Write, Delete)->
   zaya_pool:call(Pool, [{write, Write}, {delete, Delete}]).
 
-prepare_rollback(Ref, Write, Delete)->
-  prepare_rollback_from_read(fun(Keys)-> read(Ref, Keys) end, Write, Delete).
+prepare_rollback(#ref{ pterm = PTerm }, Write, Delete)->
+  #data{ dict = Dict } = persistent_term:get( PTerm ),
+  {W_acc0, D_acc} = rollback_write(Write, Dict, {[],[]}),
+  W_acc = rollback_delete(Delete, Dict, W_acc0),
+  {W_acc, D_acc}.
+
+rollback_write([{K,V}|Rest], Dict, Acc0 = {W_acc,D_acc})->
+  Acc =
+    case maps:find(K, Dict) of
+      {ok,V}-> Acc0;
+      {ok,V0}-> {[{K,V0}|W_acc], D_acc};
+      _-> {W_acc, [K|D_acc]}
+    end,
+  rollback_write(Rest, Dict, Acc);
+rollback_write([], _Dict, Acc)->
+  Acc.
+
+rollback_delete([K|Rest], Dict, Acc0)->
+  Acc =
+    case maps:find(K, Dict) of
+      {ok,V} -> [{K,V}|Acc0];
+      _-> Acc0
+    end,
+  rollback_delete(Rest, Dict, Acc);
+rollback_delete([], _Dict, Acc)->
+  Acc.
 
 is_persistent()->
   false.
-
-prepare_rollback_from_read(ReadFun, Write, Delete)->
-  WriteMap = maps:from_list(Write),
-  WriteKeys = maps:keys(WriteMap),
-  CurrentForWrites = maps:from_list(ReadFun(WriteKeys)),
-  CurrentForDeletes = maps:from_list(ReadFun(Delete)),
-  RestoreWrites =
-    maps:fold(
-      fun(Key, Existing, Acc)->
-        case maps:get(Key, WriteMap) of
-          Existing -> Acc;
-          _ -> Acc#{Key => Existing}
-        end
-      end,
-      CurrentForDeletes,
-      CurrentForWrites
-    ),
-  DeleteBack = [Key || Key <- WriteKeys, not maps:is_key(Key, CurrentForWrites)],
-  {maps:to_list(RestoreWrites), DeleteBack}.
 
 %%=================================================================
 %%	POOL API
