@@ -52,9 +52,15 @@
 %%=================================================================
 -export([
   commit/3,
-  commit1/3,
-  commit2/2,
-  rollback/2
+  prepare_rollback/3,
+  is_persistent/0
+]).
+
+%%=================================================================
+%%	POOL API
+%%=================================================================
+-export([
+  pool_batch/2
 ]).
 
 %%=================================================================
@@ -64,7 +70,7 @@
   get_size/1
 ]).
 
--record(ref,{ pterm, locks }).
+-record(ref,{ pterm, locks, pool }).
 -record(data,{ dict, index }).
 -define(ref(Ref),{?MODULE, Ref}).
 -define(none, {?MODULE, undefined}).
@@ -76,18 +82,24 @@
 create( Params )->
   open( Params ).
 
-open( _Params )->
-
+open( Params )->
   PTerm = ?ref(erlang:make_ref()),
   {ok, LocksPid} = elock:start_link( ?locks(PTerm) ),
-  persistent_term:put(PTerm, #data{
-    dict = #{},
-    index = gb_sets:new()
-  }),
+  Ref = #ref{ pterm = PTerm, locks = LocksPid, pool = undefined },
+  try
+    persistent_term:put(PTerm, #data{
+      dict = #{},
+      index = gb_sets:new()
+    }),
+    open_pool(Ref, Params)
+  catch
+    Class:Reason:Stack->
+      catch close(Ref),
+      erlang:raise(Class, Reason, Stack)
+  end.
 
-  #ref{ pterm = PTerm, locks = LocksPid }.
-
-close(#ref{ pterm = PTerm, locks = LocksPid })->
+close(#ref{ pterm = PTerm, locks = LocksPid, pool = Pool })->
+  catch close_pool(Pool),
   catch unlink( LocksPid ),
   catch exit( LocksPid, shutdown ),
   catch persistent_term:erase( PTerm ),
@@ -113,16 +125,10 @@ do_read(Dict, [Key|Rest])->
 do_read(_Dict,[])->
   [].
 
-write(#ref{ pterm = PTerm }, KVs)->
-  {ok, Unlock} = elock:lock(?locks( PTerm ), PTerm, _IsShared = false, _Timeout = infinity ),
-  try
-    Data0 = persistent_term:get( PTerm ),
-    Data = do_write( Data0, KVs ),
-    persistent_term:put( PTerm, Data ),
-    ok
-  after
-    Unlock()
-  end.
+write(#ref{ pool = disabled } = Ref, KVs)->
+  locked_update(Ref, fun(Data)-> do_write(Data, KVs) end);
+write(#ref{ pool = Pool }, KVs)->
+  zaya_pool:call(Pool, [{write, KVs}]).
 
 do_write( #data{ dict = Dict, index = Index } = Data, [{K,V} | Rest])->
   do_write(Data#data{ dict = Dict#{ K => V }, index = gb_sets:add_element(K, Index) }, Rest);
@@ -130,16 +136,10 @@ do_write(Data, [])->
   Data.
 
 
-delete(#ref{ pterm = PTerm },Keys)->
-  {ok, Unlock} = elock:lock(?locks( PTerm ), PTerm, _IsShared = false, _Timeout = infinity ),
-  try
-    Data0 = persistent_term:get( PTerm ),
-    Data = do_delete( Data0, Keys ),
-    persistent_term:put( PTerm, Data ),
-    ok
-  after
-    Unlock()
-  end.
+delete(#ref{ pool = disabled } = Ref, Keys)->
+  locked_update(Ref, fun(Data)-> do_delete(Data, Keys) end);
+delete(#ref{ pool = Pool }, Keys)->
+  zaya_pool:call(Pool, [{delete, Keys}]).
 
 do_delete( #data{ dict = Dict, index = Index } = Data, [K | Rest])->
   do_delete(Data#data{ dict = maps:remove(K, Dict), index = gb_sets:del_element(K, Index) }, Rest);
@@ -169,7 +169,7 @@ last( #ref{ pterm = PTerm } )->
 
 next( #ref{ pterm = PTerm }, Key )->
   #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
-  I = gb_sets:iterator_from(Key, Index),
+  I = gb_sets:iterator_from(Key, Index, ordered),
   case gb_sets:next( I ) of
     {Key, I1} ->
       case gb_sets:next( I1 ) of
@@ -184,23 +184,18 @@ next( #ref{ pterm = PTerm }, Key )->
 
 prev( #ref{ pterm = PTerm }, Key )->
   #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
-  case prev_key(Key, Index) of
-    undefined ->
-      undefined;
-    PrevKey ->
-      {PrevKey, maps:get(PrevKey, Dict)}
+  I = gb_sets:iterator_from(Key, Index, reversed),
+  case gb_sets:next( I ) of
+    {Key, I1} ->
+      case gb_sets:next( I1 ) of
+        {Next, _}-> {Next, maps:get(Next, Dict)};
+        _-> undefined
+      end;
+    {Next,_}->
+      {Next, maps:get(Next, Dict)};
+    _->
+      undefined
   end.
-
-prev_key(K, {_, T})->
-  prev_key(K, T, undefined).
-prev_key(K, {TK, L, _R}, Prev) when K < TK->
-  prev_key(K, L, Prev);
-prev_key(K, {TK, _L, R}, _Prev) when K > TK ->
-  prev_key(K, R, TK);
-prev_key(K, {TK, L, _R}, Prev) when K =:= TK ->
-  prev_key(K, L, Prev);
-prev_key(_K, nil, Prev) ->
-  Prev.
 
 %%=================================================================
 %%	HIGH-LEVEL API
@@ -306,8 +301,8 @@ foldl( #ref{ pterm = PTerm }, Query, UserFun, InAcc )->
 
   Itr =
     case Query of
-      #{start := Start}-> gb_sets:iterator_from(Start, Index);
-      _-> gb_sets:iterator( Index )
+      #{start := Start}-> gb_sets:iterator_from(Start, Index, ordered);
+      _-> gb_sets:iterator( Index, ordered )
     end,
 
   Fun =
@@ -354,15 +349,14 @@ do_foldl(_, _Dict, _Fun, Acc )->
 
 %----------------------FOLD RIGHT------------------------------------------
 foldr( #ref{ pterm = PTerm }, Query, UserFun, InAcc )->
-  #data{ dict = Dict} = persistent_term:get( PTerm ),
+  #data{ dict = Dict, index = Index } = persistent_term:get( PTerm ),
 
-  Records0 = lists:reverse( lists:usort( maps:to_list( Dict ))),
-
-  Records =
+  Itr =
     case Query of
-      #{start := Start}-> lists:dropwhile(fun({K,_})->K > Start end, Records0);
-      _->Records0
+      #{start := Start}-> gb_sets:iterator_from(Start, Index, reversed);
+      _-> gb_sets:iterator( Index, reversed )
     end,
+
   Fun =
     case Query of
       #{ms:=MS}->
@@ -382,24 +376,26 @@ foldr( #ref{ pterm = PTerm }, Query, UserFun, InAcc )->
   try
     case Query of
       #{ stop:=Stop }->
-        do_foldr_stop( Records, Fun, InAcc, Stop);
+        do_foldr_stop( gb_sets:next(Itr), Dict, Fun, InAcc, Stop);
       _->
-        do_foldr( Records, Fun, InAcc )
+        do_foldr( gb_sets:next(Itr), Dict, Fun, InAcc )
     end
   catch
     {stop,Acc}-> Acc
   end.
 
-do_foldr_stop( [{Key,_}=Rec| Rest], Fun, InAcc, StopKey ) when Key >= StopKey->
+do_foldr_stop( {Key, Itr}, Dict, Fun, InAcc, StopKey ) when Key >= StopKey->
+  Rec = {Key, maps:get(Key, Dict)},
   Acc = Fun( Rec, InAcc ),
-  do_foldr_stop( Rest, Fun, Acc, StopKey  );
-do_foldr_stop([], _Fun, Acc, _StopKey)->
+  do_foldr_stop( gb_sets:next(Itr), Dict, Fun, Acc, StopKey  );
+do_foldr_stop(_, _Dict, _Fun, Acc, _StopKey)->
   Acc.
 
-do_foldr( [Rec| Rest], Fun, InAcc )->
+do_foldr( {Key,Itr}, Dict, Fun, InAcc )->
+  Rec = {Key, maps:get(Key, Dict)},
   Acc = Fun( Rec, InAcc ),
-  do_foldr( Rest, Fun, Acc  );
-do_foldr([], _Fun, Acc )->
+  do_foldr( gb_sets:next(Itr), Dict, Fun, Acc  );
+do_foldr(_, _Dict, _Fun, Acc )->
   Acc.
 
 %%=================================================================
@@ -409,24 +405,66 @@ copy(Ref, Fun, InAcc)->
   foldl(Ref, #{}, Fun, InAcc).
 
 dump_batch(Ref, KVs)->
-  write(Ref, KVs).
+  locked_update(Ref, fun(Data)-> do_write(Data, KVs) end).
 
 %%=================================================================
 %%	TRANSACTION API
 %%=================================================================
-commit(Ref, Write, Delete)->
-  write( Ref, Write ),
-  delete( Ref, Delete ),
-  ok.
+commit(#ref{ pool = disabled } = Ref, Write, Delete)->
+  locked_update(
+    Ref,
+    fun(Data)->
+      do_delete(do_write(Data, Write), Delete)
+    end
+  );
+commit(#ref{ pool = Pool }, Write, Delete)->
+  zaya_pool:call(Pool, [{write, Write}, {delete, Delete}]).
 
-commit1(_Ref, Write, Delete)->
-  {Write, Delete}.
+prepare_rollback(#ref{ pterm = PTerm }, Write, Delete)->
+  #data{ dict = Dict } = persistent_term:get( PTerm ),
+  {W_acc0, D_acc} = rollback_write(Write, Dict, {[],[]}),
+  W_acc = rollback_delete(Delete, Dict, W_acc0),
+  {W_acc, D_acc}.
 
-commit2(Ref, {Write, Delete})->
-  commit( Ref, Write, Delete ).
+rollback_write([{K,V}|Rest], Dict, Acc0 = {W_acc,D_acc})->
+  Acc =
+    case maps:find(K, Dict) of
+      {ok,V}-> Acc0;
+      {ok,V0}-> {[{K,V0}|W_acc], D_acc};
+      _-> {W_acc, [K|D_acc]}
+    end,
+  rollback_write(Rest, Dict, Acc);
+rollback_write([], _Dict, Acc)->
+  Acc.
 
-rollback( _Ref, _TRef )->
-  ok.
+rollback_delete([K|Rest], Dict, Acc0)->
+  Acc =
+    case maps:find(K, Dict) of
+      {ok,V} -> [{K,V}|Acc0];
+      _-> Acc0
+    end,
+  rollback_delete(Rest, Dict, Acc);
+rollback_delete([], _Dict, Acc)->
+  Acc.
+
+is_persistent()->
+  false.
+
+%%=================================================================
+%%	POOL API
+%%=================================================================
+pool_batch(Ref, Requests)->
+  locked_update(Ref, fun(Data)-> pool_batch(Requests, Data, _Writes = []) end).
+
+pool_batch([{write, KVs}|Rest], Data, Writes)->
+  pool_batch(Rest, Data, [KVs|Writes]);
+pool_batch(Requests, Data, [_|_]=Writes)->
+  KVs = lists:append(lists:reverse(Writes)),
+  pool_batch(Requests, do_write(Data, KVs), []);
+pool_batch([{delete, Keys}|Rest], Data, Writes)->
+  pool_batch(Rest, do_delete(Data, Keys), Writes);
+pool_batch([], Data, [])->
+  Data.
 
 %%=================================================================
 %%	INFO
@@ -435,5 +473,38 @@ get_size( #ref{ pterm = PTerm } )->
   Data = persistent_term:get( PTerm ),
   size( term_to_binary( Data ) ).
 
+%%=================================================================
+%%	INTERNAL UTILITIES
+%%=================================================================
+locked_update(#ref{ pterm = PTerm }, Update)->
+  {ok, Unlock} = elock:lock(?locks( PTerm ), PTerm, _IsShared = false, _Timeout = infinity ),
+  try
+    Data0 = persistent_term:get( PTerm ),
+    Data = Update(Data0),
+    persistent_term:put( PTerm, Data ),
+    ok
+  after
+    Unlock()
+  end.
 
+open_pool(Ref, #{pool := disabled})->
+  Ref#ref{pool = disabled};
+open_pool(Ref, Params) when is_map(Params)->
+  {ok, Pool} = zaya_pool:start_link(pool_params(Ref#ref{pool = disabled}, Params)),
+  Ref#ref{pool = Pool}.
 
+close_pool(undefined)->
+  ok;
+close_pool(disabled)->
+  ok;
+close_pool(Pool)->
+  zaya_pool:stop(Pool).
+
+pool_params(Ref, Params) when is_map(Params)->
+  maps:merge(
+    maps:get(pool, Params, #{}),
+    #{
+      ref => Ref,
+      module => ?MODULE
+    }
+  ).
