@@ -33,6 +33,7 @@
   prepare_rollback_roundtrip_test/1,
   prepare_rollback_unchanged_write_test/1,
   is_persistent_test/1,
+  failed_update_releases_lock_test/1,
   concurrent_write_callers_test/1
 ]).
 
@@ -62,6 +63,7 @@ mode_tests()->
     prepare_rollback_roundtrip_test,
     prepare_rollback_unchanged_write_test,
     is_persistent_test,
+    failed_update_releases_lock_test,
     concurrent_write_callers_test
   ].
 
@@ -380,6 +382,34 @@ prepare_rollback_unchanged_write_test(Config)->
 
 is_persistent_test(_Config)->
   ?assertEqual(false, zaya_pterm:is_persistent()).
+
+-spec failed_update_releases_lock_test(list()) -> ok.
+failed_update_releases_lock_test(Config)->
+  with_ref(
+    Config,
+    fun(Ref)->
+      ok = zaya_pterm:write(Ref, [{existing, original}]),
+      ?assertError(
+        function_clause,
+        zaya_pterm:dump_batch(Ref, [{existing, changed}, invalid_record])
+      ),
+      ?assertEqual([{existing, original}], zaya_pterm:read(Ref, [existing])),
+
+      % Keep the failed caller alive so its exit cannot release a leaked lock.
+      {Writer, Monitor} = spawn_monitor(fun()->
+        ok = zaya_pterm:write(Ref, [{after_failure, ok}])
+      end),
+      receive
+        {'DOWN', Monitor, process, Writer, Reason}->
+          ?assertEqual(normal, Reason)
+      after
+        5000 ->
+          exit(Writer, kill),
+          ct:fail(lock_not_released)
+      end,
+      ?assertEqual([{after_failure, ok}], zaya_pterm:read(Ref, [after_failure]))
+    end
+  ).
 
 concurrent_write_callers_test(Config)->
   with_ref(

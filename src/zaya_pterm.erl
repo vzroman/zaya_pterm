@@ -477,14 +477,14 @@ get_size( #ref{ pterm = PTerm } )->
 %%	INTERNAL UTILITIES
 %%=================================================================
 locked_update(#ref{ pterm = PTerm }, Update)->
-  {ok, Unlock} = elock:lock(?locks( PTerm ), PTerm, _IsShared = false, _Timeout = infinity ),
+  {ok, LockRef} = elock:lock(?locks( PTerm ), PTerm, [node()]),
   try
     Data0 = persistent_term:get( PTerm ),
     Data = Update(Data0),
     persistent_term:put( PTerm, Data ),
     ok
   after
-    Unlock()
+    elock:unlock(LockRef)
   end.
 
 open_pool(Ref, #{pool := disabled})->
